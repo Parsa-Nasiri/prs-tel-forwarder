@@ -74,14 +74,36 @@ def send_text_to_rubika(channel_name: str, text: str, msg_date: datetime) -> boo
     return all_ok
 
 
-def send_media_to_rubika(
+def upload_file_to_rubika(file_bytes: bytes, filename: str) -> str | None:
+    """
+    Upload a file to Rubika and return its file_id.
+    Returns None if upload fails.
+    """
+    url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/uploadFile"
+    try:
+        files = {"file": (filename, BytesIO(file_bytes))}
+        resp = requests.post(url, files=files, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and "file_id" in data:
+                return data["file_id"]
+            else:
+                logger.error(f"uploadFile response missing file_id: {resp.text}")
+        else:
+            logger.error(f"uploadFile failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"uploadFile exception: {e}")
+    return None
+
+
+def send_media_by_id(
     channel_name: str,
     msg_date: datetime,
-    file_bytes: bytes,
-    filename: str,
+    file_id: str,
     media_type: str,
     caption: str = "",
 ) -> bool:
+    """Send a media file using its file_id."""
     date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
     header = f"=============\n{channel_name}\n{date_str}\n============="
     full_caption = f"{header}\n\n{caption}" if caption else header
@@ -98,12 +120,15 @@ def send_media_to_rubika(
 
     all_ok = True
     for chat_id in RUBIKA_CHAT_IDS:
+        payload = {
+            "chat_id": chat_id,
+            "file": file_id,
+            "caption": full_caption,
+        }
         try:
-            files = {"file": (filename, BytesIO(file_bytes))}
-            data = {"chat_id": chat_id, "caption": full_caption}
-            resp = requests.post(url, data=data, files=files, timeout=30)
+            resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code == 200:
-                logger.info(f"✅ {media_type} forwarded to {chat_id} from {channel_name}")
+                logger.info(f"✅ {media_type} sent to {chat_id} from {channel_name}")
             else:
                 logger.error(f"❌ Rubika media error for {chat_id}: {resp.status_code} {resp.text}")
                 all_ok = False
@@ -115,13 +140,14 @@ def send_media_to_rubika(
 
 async def forward_message(client, message, channel_name, state):
     msg_date = message.date
+    # If it's a pure text message (no media)
     if message.text and not message.media:
-        # Pure text
         if send_text_to_rubika(channel_name, message.text, msg_date):
             state[channel_name] = message.id
             save_state(state)
         return
 
+    # Media message
     if not message.file or not message.file.size:
         logger.warning(f"Message {message.id} has no file size info, skipping.")
         return
@@ -139,6 +165,7 @@ async def forward_message(client, message, channel_name, state):
         save_state(state)
         return
 
+    # Determine media type and filename
     if message.photo:
         media_type, filename = "photo", "photo.jpg"
     elif message.video:
@@ -152,6 +179,7 @@ async def forward_message(client, message, channel_name, state):
 
     caption = message.text or ""
 
+    # Download the media into memory
     try:
         media_bytes = await client.download_media(message, file=bytes)
         logger.info(f"Downloaded {media_type} ({len(media_bytes)} bytes) from {channel_name}")
@@ -159,7 +187,14 @@ async def forward_message(client, message, channel_name, state):
         logger.error(f"Failed to download media: {e}")
         return
 
-    if send_media_to_rubika(channel_name, msg_date, media_bytes, filename, media_type, caption):
+    # Upload to Rubika and get file_id
+    file_id = upload_file_to_rubika(media_bytes, filename)
+    if not file_id:
+        logger.error("Failed to obtain file_id from Rubika, skipping.")
+        return
+
+    # Send using the file_id
+    if send_media_by_id(channel_name, msg_date, file_id, media_type, caption):
         state[channel_name] = message.id
         save_state(state)
 
