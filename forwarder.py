@@ -33,12 +33,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- Helper: clean backticks ----------
+
 def clean_text(text: str) -> str:
-    """Remove backticks from text."""
+    """Remove backticks."""
     return text.replace('`', '')
 
-# ---------- File I/O ----------
+
 def load_channels() -> list[str]:
     if not CHANNELS_FILE.exists():
         logger.error(f"File {CHANNELS_FILE} not found!")
@@ -46,19 +46,22 @@ def load_channels() -> list[str]:
     with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
+
 def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-# ---------- Rubika API ----------
+
+# ---------- Rubika send functions ----------
 def send_text_to_rubika(channel_name: str, text: str, msg_date: datetime) -> bool:
-    text = clean_text(text)  # remove backticks
+    text = clean_text(text)
     date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
     formatted = f"=============\n{channel_name}\n{date_str}\n=============\n\n{text}"
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/sendMessage"
@@ -77,40 +80,25 @@ def send_text_to_rubika(channel_name: str, text: str, msg_date: datetime) -> boo
             all_ok = False
     return all_ok
 
-def upload_file_to_rubika(file_bytes: bytes, filename: str, file_type: str = "document") -> str | None:
-    """Upload file and return file_id."""
-    url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/uploadFile"
-    try:
-        files = {"file": (filename, BytesIO(file_bytes))}
-        data = {
-            "file_name": filename,
-            "file_type": file_type,
-        }
-        resp = requests.post(url, files=files, data=data, timeout=30)
-        if resp.status_code == 200:
-            result = resp.json()
-            if isinstance(result, dict) and "file_id" in result:
-                return result["file_id"]
-            else:
-                logger.error(f"Unexpected uploadFile response: {resp.text}")
-        else:
-            logger.error(f"uploadFile HTTP {resp.status_code}: {resp.text}")
-    except Exception as e:
-        logger.error(f"uploadFile exception: {e}")
-    return None
 
-def send_media_by_id(
+def send_media_direct(
     channel_name: str,
     msg_date: datetime,
-    file_id: str,
+    file_bytes: bytes,
+    filename: str,
     media_type: str,
     caption: str = "",
 ) -> bool:
-    caption = clean_text(caption)  # remove backticks
+    """
+    Send a media file directly to Rubika (one-step multipart upload).
+    media_type: 'photo', 'video', 'audio', 'voice', 'document'
+    """
+    caption = clean_text(caption)
     date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
     header = f"=============\n{channel_name}\n{date_str}\n============="
     full_caption = f"{header}\n\n{caption}" if caption else header
 
+    # Map to correct Rubika send method
     method_map = {
         "photo": "sendPhoto",
         "video": "sendVideo",
@@ -123,13 +111,17 @@ def send_media_by_id(
 
     all_ok = True
     for chat_id in RUBIKA_CHAT_IDS:
-        payload = {
-            "chat_id": chat_id,
-            "file": file_id,
-            "caption": full_caption,
-        }
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            # Multipart form: file + metadata fields
+            files = {"file": (filename, BytesIO(file_bytes))}
+            data = {
+                "chat_id": chat_id,
+                "caption": full_caption,
+                "file_name": filename,          # required for some endpoints
+                # "file_type": media_type,     # optional, may be auto-detected
+            }
+            # Use POST with files and data (this sends application/x-www-form-urlencoded + multipart)
+            resp = requests.post(url, data=data, files=files, timeout=30)
             if resp.status_code == 200:
                 logger.info(f"✅ {media_type} sent to {chat_id} from {channel_name}")
             else:
@@ -140,30 +132,25 @@ def send_media_by_id(
             all_ok = False
     return all_ok
 
-# ---------- Core forwarding (used for both normal and debug) ----------
+
+# ---------- Core forwarding ----------
 async def forward_message(client, message, channel_name, state, skip_duplicate_check=False):
-    """
-    Forward a single Telegram message to Rubika.
-    If skip_duplicate_check is True, the message is sent regardless of the stored ID
-    (used for the initial debug resend).
-    """
     msg_date = message.date
 
-    # Duplicate check (unless skipped)
     if not skip_duplicate_check:
         last_id = state.get(channel_name, 0)
         if message.id <= last_id:
-            logger.debug(f"Skipping duplicate message {message.id}")
+            logger.debug(f"Skipping duplicate {message.id}")
             return
 
-    # Pure text message
+    # Text only
     if message.text and not message.media:
         if send_text_to_rubika(channel_name, message.text, msg_date):
             state[channel_name] = message.id
             save_state(state)
         return
 
-    # Media message
+    # Media handling
     if not message.file or not message.file.size:
         logger.warning(f"Message {message.id} has no file size info, skipping.")
         return
@@ -175,7 +162,6 @@ async def forward_message(client, message, channel_name, state, skip_duplicate_c
             f"⚠️ Large file skipped ({size_mb:.1f} MB)\n"
             f"Original filename: {message.file.name or 'unknown'}"
         )
-        logger.info(f"Skipping large file ({size_mb:.1f} MB) from {channel_name}")
         send_text_to_rubika(channel_name, skip_text, msg_date)
         state[channel_name] = message.id
         save_state(state)
@@ -195,33 +181,24 @@ async def forward_message(client, message, channel_name, state, skip_duplicate_c
 
     caption = message.text or ""
 
-    # Download media into memory
+    # Download into memory
     try:
         media_bytes = await client.download_media(message, file=bytes)
         logger.info(f"Downloaded {media_type} ({len(media_bytes)} bytes) from {channel_name}")
     except Exception as e:
-        logger.error(f"Failed to download media: {e}")
+        logger.error(f"Download failed: {e}")
         return
 
-    # Upload to Rubika and get file_id
-    file_id = upload_file_to_rubika(media_bytes, filename, media_type)
-    if not file_id:
-        logger.error("Failed to obtain file_id from Rubika, skipping.")
-        return
-
-    # Send using file_id
-    if send_media_by_id(channel_name, msg_date, file_id, media_type, caption):
+    # Send directly (no separate upload step)
+    if send_media_direct(channel_name, msg_date, media_bytes, filename, media_type, caption):
         state[channel_name] = message.id
         save_state(state)
 
-# ---------- Catch‑up (runs each start) ----------
+
+# ---------- Startup catch‑up & debug ----------
 async def catch_up(client, channels, state):
-    """
-    If state is empty (first run), just initialise markers.
-    Otherwise, forward any missed messages.
-    """
     if not state:
-        logger.info("First run – initialising state without forwarding old messages.")
+        logger.info("First run – initialising state without forwarding old messages (debug will resend last 3).")
         for channel in channels:
             try:
                 messages = await client.get_messages(channel, limit=1)
@@ -252,27 +229,22 @@ async def catch_up(client, channels, state):
         except Exception as e:
             logger.error(f"Error catching up {channel}: {e}")
 
-# ---------- Debug: resend last 3 messages (first run only) ----------
+
 async def debug_resend_last3(client, channels, state):
-    """
-    Resend the last 3 messages of each channel for debugging purposes.
-    This runs only on the first run (state was empty before catch_up).
-    Messages are sent even if they are older than the current state markers.
-    """
-    logger.info("DEBUG: Resending the 3 most recent messages from each channel...")
+    logger.info("DEBUG: Resending the 3 most recent messages from each channel (first run only).")
     for channel in channels:
         try:
             messages = await client.get_messages(channel, limit=3)
             if not messages:
                 continue
-            for msg in reversed(messages):  # oldest first
+            for msg in reversed(messages):   # oldest first
                 if not msg.text and not msg.media:
                     continue
                 logger.info(f"DEBUG: resending {msg.id} from {channel}")
-                # skip duplicate check for these
                 await forward_message(client, msg, channel, state, skip_duplicate_check=True)
         except Exception as e:
             logger.error(f"DEBUG resend error for {channel}: {e}")
+
 
 # ---------- Main ----------
 async def main():
@@ -289,15 +261,13 @@ async def main():
     logger.info("Telegram client ready")
 
     state = load_state()
-    first_run = (state == {})   # remember before catch_up fills it
+    first_run = (state == {})
 
     await catch_up(client, channels, state)
 
-    # On the very first run, resend the latest 3 messages for immediate verification
     if first_run:
         await debug_resend_last3(client, channels, state)
 
-    # Live handler
     @client.on(events.NewMessage(chats=channels))
     async def handler(event):
         try:
@@ -320,6 +290,7 @@ async def main():
 
     await client.disconnect()
     logger.info("Session closed.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
