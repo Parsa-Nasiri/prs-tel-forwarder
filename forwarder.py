@@ -74,23 +74,30 @@ def send_text_to_rubika(channel_name: str, text: str, msg_date: datetime) -> boo
     return all_ok
 
 
-def upload_file_to_rubika(file_bytes: bytes, filename: str) -> str | None:
+def upload_file_to_rubika(file_bytes: bytes, filename: str, file_type: str = "document") -> str | None:
     """
     Upload a file to Rubika and return its file_id.
-    Returns None if upload fails.
+    file_type: one of 'photo', 'video', 'audio', 'voice', 'document'
     """
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/uploadFile"
     try:
+        # Prepare the file and required metadata
         files = {"file": (filename, BytesIO(file_bytes))}
-        resp = requests.post(url, files=files, timeout=30)
+        data = {
+            "file_name": filename,
+            "file_type": file_type,          # Required – see Rubika docs
+            # "chat_id" might also be required? Usually not, but test if needed
+        }
+        resp = requests.post(url, files=files, data=data, timeout=30)
         if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, dict) and "file_id" in data:
-                return data["file_id"]
+            result = resp.json()
+            # Rubika's response structure: {"status":"OK","file_id":"..."}
+            if isinstance(result, dict) and "file_id" in result:
+                return result["file_id"]
             else:
-                logger.error(f"uploadFile response missing file_id: {resp.text}")
+                logger.error(f"Unexpected uploadFile response: {resp.text}")
         else:
-            logger.error(f"uploadFile failed: {resp.status_code} {resp.text}")
+            logger.error(f"uploadFile HTTP {resp.status_code}: {resp.text}")
     except Exception as e:
         logger.error(f"uploadFile exception: {e}")
     return None
