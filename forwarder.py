@@ -6,26 +6,26 @@ import logging
 import sys
 from pathlib import Path
 from datetime import datetime
+from io import BytesIO
 
 import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# ---------- Configuration (from environment) ----------
+# ---------- Configuration ----------
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["STRING_SESSION"]
 RUBIKA_BOT_TOKEN = os.environ["RUBIKA_BOT_TOKEN"]
-
-# Support one or multiple chat IDs (comma-separated)
 raw_chat_ids = os.environ.get("RUBIKA_CHAT_IDS") or os.environ["RUBIKA_CHAT_ID"]
 RUBIKA_CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
 
 CHANNELS_FILE = Path("channels.json")
 STATE_FILE = Path("state.json")
-RUN_DURATION = 21300  # 5h55m
+RUN_DURATION = 21300  # 5h 55m
 
-# ---------- Logging ----------
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -39,11 +39,7 @@ def load_channels() -> list[str]:
         logger.error(f"File {CHANNELS_FILE} not found!")
         sys.exit(1)
     with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
-        channels = json.load(f)
-    if not isinstance(channels, list):
-        logger.error("channels.json must be a JSON array.")
-        sys.exit(1)
-    return channels
+        return json.load(f)
 
 
 def load_state() -> dict:
@@ -58,50 +54,147 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-def send_to_rubika(channel_name: str, text: str, msg_date: datetime) -> bool:
-    """
-    Send the formatted message to ALL configured Rubika chat IDs.
-    Returns True if all sends were successful, False otherwise.
-    """
+def send_text_to_rubika(channel_name: str, text: str, msg_date: datetime) -> bool:
     date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
     formatted = f"=============\n{channel_name}\n{date_str}\n=============\n\n{text}"
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/sendMessage"
     all_ok = True
-
     for chat_id in RUBIKA_CHAT_IDS:
         payload = {"chat_id": chat_id, "text": formatted}
         try:
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code == 200:
-                logger.info(f"✅ Forwarded to {chat_id} from {channel_name}")
+                logger.info(f"✅ Text forwarded to {chat_id} from {channel_name}")
             else:
                 logger.error(f"❌ Rubika error for {chat_id}: {resp.status_code} {resp.text}")
                 all_ok = False
         except Exception as e:
             logger.error(f"❌ Network error to {chat_id}: {e}")
             all_ok = False
-
     return all_ok
 
 
-async def catch_up(client: TelegramClient, channels: list[str], state: dict):
+def send_media_to_rubika(
+    channel_name: str,
+    msg_date: datetime,
+    file_bytes: bytes,
+    filename: str,
+    media_type: str,
+    caption: str = "",
+) -> bool:
     """
-    If state is empty (first run), just record the latest message ID
-    without forwarding anything. Otherwise, forward only missed messages.
+    media_type: 'photo', 'video', 'audio', 'voice', 'document'
     """
+    date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
+    header = f"=============\n{channel_name}\n{date_str}\n============="
+    if caption:
+        full_caption = f"{header}\n\n{caption}"
+    else:
+        full_caption = header
+
+    method_map = {
+        "photo": "sendPhoto",
+        "video": "sendVideo",
+        "audio": "sendAudio",
+        "voice": "sendVoice",
+        "document": "sendDocument",
+    }
+    method = method_map.get(media_type, "sendDocument")
+    url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/{method}"
+
+    all_ok = True
+    for chat_id in RUBIKA_CHAT_IDS:
+        try:
+            files = {"file": (filename, BytesIO(file_bytes))}
+            data = {"chat_id": chat_id, "caption": full_caption}
+            resp = requests.post(url, data=data, files=files, timeout=30)
+            if resp.status_code == 200:
+                logger.info(f"✅ {media_type} forwarded to {chat_id} from {channel_name}")
+            else:
+                logger.error(f"❌ Rubika media error for {chat_id}: {resp.status_code} {resp.text}")
+                all_ok = False
+        except Exception as e:
+            logger.error(f"❌ Network error to {chat_id}: {e}")
+            all_ok = False
+    return all_ok
+
+
+async def forward_message(client, message, channel_name, state):
+    """Unified forwarding logic for text and media messages."""
+    msg_date = message.date
+    if message.text and not message.media:
+        # Pure text message
+        if send_text_to_rubika(channel_name, message.text, msg_date):
+            state[channel_name] = message.id
+            save_state(state)
+        return
+
+    # Media message (photo, video, document, audio, voice, etc.)
+    # Determine file size
+    if not message.file or not message.file.size:
+        logger.warning(f"Message {message.id} has no file size info, skipping.")
+        return
+
+    file_size = message.file.size
+    if file_size > MAX_FILE_SIZE:
+        # File too large – send a text notification
+        size_mb = file_size / (1024 * 1024)
+        skip_text = (
+            f"⚠️ Large file skipped ({size_mb:.1f} MB)\n"
+            f"Original filename: {message.file.name or 'unknown'}"
+        )
+        logger.info(f"Skipping large file ({size_mb:.1f} MB) from {channel_name}")
+        send_text_to_rubika(channel_name, skip_text, msg_date)
+        # Still mark as processed so we don't keep trying
+        state[channel_name] = message.id
+        save_state(state)
+        return
+
+    # Determine media type
+    if message.photo:
+        media_type = "photo"
+        filename = "photo.jpg"
+    elif message.video:
+        media_type = "video"
+        filename = message.file.name or "video.mp4"
+    elif message.audio:
+        media_type = "audio"
+        filename = message.file.name or "audio.mp3"
+    elif message.voice:
+        media_type = "voice"
+        filename = message.file.name or "voice.ogg"
+    else:
+        media_type = "document"
+        filename = message.file.name or "file"
+
+    caption = message.text or ""
+
+    # Download the media into memory
+    try:
+        media_bytes = await client.download_media(message, file=bytes)
+        logger.info(f"Downloaded {media_type} ({len(media_bytes)} bytes) from {channel_name}")
+    except Exception as e:
+        logger.error(f"Failed to download media: {e}")
+        return
+
+    if send_media_to_rubika(channel_name, msg_date, media_bytes, filename, media_type, caption):
+        state[channel_name] = message.id
+        save_state(state)
+
+
+async def catch_up(client, channels, state):
     if not state:
-        logger.info("First run detected – initialising state without forwarding old messages.")
+        logger.info("First run – initialising state without forwarding old messages.")
         for channel in channels:
             try:
                 messages = await client.get_messages(channel, limit=1)
                 if messages and messages[0]:
-                    last_id = messages[0].id
-                    state[channel] = last_id
-                    logger.info(f"Start marker for {channel} at message {last_id}")
+                    state[channel] = messages[0].id
+                    logger.info(f"Start marker for {channel} at message {messages[0].id}")
                 else:
                     state[channel] = 0
             except Exception as e:
-                logger.error(f"Failed to initialise state for {channel}: {e}")
+                logger.error(f"Failed to initialise {channel}: {e}")
         save_state(state)
         return
 
@@ -111,15 +204,15 @@ async def catch_up(client: TelegramClient, channels: list[str], state: dict):
             messages = await client.get_messages(channel, limit=10)
             if not messages:
                 continue
-            for msg in reversed(messages):  # oldest first
-                if not msg.text:
-                    continue
+            for msg in reversed(messages):
                 last_id = state.get(channel, 0)
-                if msg.id > last_id:
-                    logger.info(f"Missed message {msg.id} from {channel}")
-                    if send_to_rubika(channel, msg.text, msg.date):
-                        state[channel] = msg.id
-                        save_state(state)
+                if msg.id <= last_id:
+                    continue
+                # Skip if no content
+                if not msg.text and not msg.media:
+                    continue
+                logger.info(f"Missed message {msg.id} from {channel}")
+                await forward_message(client, msg, channel, state)
         except Exception as e:
             logger.error(f"Error catching up {channel}: {e}")
 
@@ -145,17 +238,12 @@ async def main():
         try:
             chat = await event.get_chat()
             channel_name = chat.title
-            text = event.message.text
-            if not text:
-                return
             last_id = state.get(channel_name, 0)
             if event.message.id <= last_id:
                 logger.debug("Duplicate message, skipping")
                 return
             logger.info(f"New message from {channel_name}")
-            if send_to_rubika(channel_name, text, event.message.date):
-                state[channel_name] = event.message.id
-                save_state(state)
+            await forward_message(client, event.message, channel_name, state)
         except Exception as e:
             logger.error(f"Handler error: {e}")
 
