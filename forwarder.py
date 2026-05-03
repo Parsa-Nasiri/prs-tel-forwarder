@@ -23,7 +23,7 @@ RUBIKA_CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()
 
 CHANNELS_FILE = Path("channels.json")
 STATE_FILE = Path("state.json")
-RUN_DURATION = 21300          # 5h 55min
+RUN_DURATION = 21000          # 5h 50min (10‑min gap between jobs)
 MAX_FILE_SIZE = 50 * 1024 * 1024   # 50 MB
 
 logging.basicConfig(
@@ -94,7 +94,6 @@ def send_media_direct(
     header = f"=============\n{channel_name}\n{date_str}\n============="
     full_caption = f"{header}\n\n{caption}" if caption else header
 
-    # Map media_type to Rubika method name
     method_map = {
         "photo": "sendPhoto",
         "video": "sendVideo",
@@ -108,13 +107,12 @@ def send_media_direct(
     all_ok = True
     for chat_id in RUBIKA_CHAT_IDS:
         try:
-            # Multipart data as per Rubika docs
             files = {"file": (filename, BytesIO(file_bytes))}
             data = {
                 "chat_id": chat_id,
                 "caption": full_caption,
                 "file_name": filename,
-                "file_type": media_type,        # required
+                "file_type": media_type,
             }
             resp = requests.post(url, data=data, files=files, timeout=30)
 
@@ -171,7 +169,6 @@ async def forward_message(client, message, channel_name, state, skip_duplicate_c
         save_state(state)
         return
 
-    # Determine media type
     if message.photo:
         media_type, filename = "photo", "photo.jpg"
     elif message.video:
@@ -193,7 +190,6 @@ async def forward_message(client, message, channel_name, state, skip_duplicate_c
         logger.error(f"Download failed: {e}")
         return
 
-    # Send directly with multipart
     if send_media_direct(channel_name, msg_date, media_bytes, filename, media_type, caption):
         state[channel_name] = message.id
         save_state(state)
