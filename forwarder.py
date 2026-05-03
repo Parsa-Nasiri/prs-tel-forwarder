@@ -8,22 +8,20 @@ from pathlib import Path
 
 import requests
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
-# ---------- Configuration (via environment variables) ----------
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-RUBIKA_BOT_TOKEN = os.environ.get("RUBIKA_BOT_TOKEN", "")
-RUBIKA_CHAT_ID = os.environ.get("RUBIKA_CHAT_ID", "")
+# ---------- Configuration (all from environment) ----------
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+STRING_SESSION = os.environ["STRING_SESSION"]  # Telethon string session
+RUBIKA_BOT_TOKEN = os.environ["RUBIKA_BOT_TOKEN"]
+RUBIKA_CHAT_ID = os.environ["RUBIKA_CHAT_ID"]
 
-# Channels list (editable JSON file)
 CHANNELS_FILE = Path("channels.json")
-# Persistent state (tracks last forwarded message ID per channel)
 STATE_FILE = Path("state.json")
-# Run duration: 5 hours 40 minutes (20400 seconds). This exits 20 minutes before
-# the GitHub Actions 6‑hour timeout, allowing the next run to start seamlessly.
-RUN_DURATION = 20400  # seconds
+# Run exactly 5 hours 55 minutes (21300 seconds) – leaves a 5‑min gap before next run
+RUN_DURATION = 21300
 
-# ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -33,20 +31,15 @@ logger = logging.getLogger(__name__)
 
 
 def load_channels() -> list[str]:
-    """Load channel list from channels.json."""
     if not CHANNELS_FILE.exists():
-        logger.error(f"Channels file {CHANNELS_FILE} not found!")
+        logger.error(f"File {CHANNELS_FILE} not found!")
         sys.exit(1)
     with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
         channels = json.load(f)
-    if not isinstance(channels, list):
-        logger.error("channels.json must be a JSON array.")
-        sys.exit(1)
     return channels
 
 
 def load_state() -> dict:
-    """Load persistent state (channel_name -> last_message_id)."""
     if STATE_FILE.exists():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -54,73 +47,61 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    """Save state to file."""
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 
 def send_to_rubika(channel_name: str, text: str) -> bool:
-    """Format the message and send it to the Rubika bot."""
     formatted = f"=============\n{channel_name}\n=============\n\n{text}"
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": RUBIKA_CHAT_ID,
-        "text": formatted,
-    }
+    payload = {"chat_id": RUBIKA_CHAT_ID, "text": formatted}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code == 200:
-            logger.info(f"✅ Forwarded message from {channel_name}")
+            logger.info(f"✅ Forwarded from {channel_name}")
             return True
-        else:
-            logger.error(f"❌ Rubika API error: {resp.status_code} {resp.text}")
-            return False
+        logger.error(f"Rubika error {resp.status_code}: {resp.text}")
     except Exception as e:
-        logger.error(f"❌ Failed to send to Rubika: {e}")
-        return False
+        logger.error(f"Request failed: {e}")
+    return False
 
 
-async def catch_up_missed_messages(client: TelegramClient, channels: list[str], state: dict):
-    """Fetch recent messages for each channel and forward any that were missed."""
-    logger.info("Checking for missed messages...")
+async def catch_up(client: TelegramClient, channels: list[str], state: dict):
+    """Fetch the last 10 messages of each channel, forward any missed ones."""
+    logger.info("Checking for missed messages…")
     for channel in channels:
         try:
             messages = await client.get_messages(channel, limit=10)
             if not messages:
                 continue
-            # Process oldest first to maintain order
-            for msg in reversed(messages):
+            for msg in reversed(messages):  # oldest first
                 if not msg.text:
                     continue
                 last_id = state.get(channel, 0)
                 if msg.id > last_id:
-                    logger.info(f"Caught up missed message {msg.id} from {channel}")
-                    success = send_to_rubika(channel, msg.text)
-                    if success:
+                    logger.info(f"Missed message {msg.id} from {channel}")
+                    if send_to_rubika(channel, msg.text):
                         state[channel] = msg.id
                         save_state(state)
         except Exception as e:
-            logger.error(f"Error fetching messages from {channel}: {e}")
+            logger.error(f"Error catching up {channel}: {e}")
 
 
 async def main():
-    if not all([API_ID, API_HASH, RUBIKA_BOT_TOKEN, RUBIKA_CHAT_ID]):
-        logger.error("Missing required environment variables: API_ID, API_HASH, RUBIKA_BOT_TOKEN, RUBIKA_CHAT_ID")
+    if not all([API_ID, API_HASH, STRING_SESSION, RUBIKA_BOT_TOKEN, RUBIKA_CHAT_ID]):
+        logger.error("Missing required environment variables!")
         sys.exit(1)
 
     channels = load_channels()
-    logger.info(f"Monitoring channels: {channels}")
+    logger.info(f"Monitoring: {channels}")
+
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+    await client.start()
+    logger.info("Telegram client ready")
 
     state = load_state()
+    await catch_up(client, channels, state)
 
-    client = TelegramClient("telegram_session", API_ID, API_HASH)
-    await client.start()
-    logger.info("Telegram client started")
-
-    # Catch up on any messages missed between runs
-    await catch_up_missed_messages(client, channels, state)
-
-    # Register handler for new messages
     @client.on(events.NewMessage(chats=channels))
     async def handler(event):
         try:
@@ -130,26 +111,28 @@ async def main():
             if not text:
                 return
             logger.info(f"New message from {channel_name}")
-            success = send_to_rubika(channel_name, text)
-            if success:
+            last_id = state.get(channel_name, 0)
+            if event.message.id <= last_id:
+                logger.debug("Duplicate message, skipping")
+                return
+            if send_to_rubika(channel_name, text):
                 state[channel_name] = event.message.id
                 save_state(state)
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"Handler error: {e}")
 
-    logger.info("Listening for new messages...")
-    start_time = time.time()
+    logger.info("Now forwarding messages in real‑time…")
+    start = time.time()
 
-    # Keep running until just before the GitHub Actions timeout
     while True:
-        elapsed = time.time() - start_time
+        elapsed = time.time() - start
         if elapsed >= RUN_DURATION:
-            logger.info(f"Runtime reached {elapsed/3600:.2f} hours, exiting cleanly.")
+            logger.info(f"Time limit reached ({elapsed/3600:.2f}h), exiting.")
             break
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
     await client.disconnect()
-    logger.info("Client disconnected. Script finished.")
+    logger.info("Session closed.")
 
 
 if __name__ == "__main__":
