@@ -2,17 +2,17 @@ name: Telegram to Rubika Forwarder
 
 on:
   schedule:
-    # Runs every 5 hours to maintain 24/7 coverage
-    - cron: "0 */5 * * *"
-  workflow_dispatch:  # Allows manual trigger
+    # Every 6 hours – runs at 00:00, 06:00, 12:00, 18:00 UTC
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
 
 jobs:
   forwarder:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6-hour hard limit
+    timeout-minutes: 360   # 6‑hour hard limit
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -27,13 +27,7 @@ jobs:
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
+          STRING_SESSION: ${{ secrets.STRING_SESSION }}
           RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
           RUBIKA_CHAT_ID: ${{ secrets.RUBIKA_CHAT_ID }}
         run: python forwarder.py
-
-      - name: Upload state (for debugging)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: state
-          path: state.json
