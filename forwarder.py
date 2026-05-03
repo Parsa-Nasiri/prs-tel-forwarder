@@ -82,15 +82,9 @@ def send_media_to_rubika(
     media_type: str,
     caption: str = "",
 ) -> bool:
-    """
-    media_type: 'photo', 'video', 'audio', 'voice', 'document'
-    """
     date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
     header = f"=============\n{channel_name}\n{date_str}\n============="
-    if caption:
-        full_caption = f"{header}\n\n{caption}"
-    else:
-        full_caption = header
+    full_caption = f"{header}\n\n{caption}" if caption else header
 
     method_map = {
         "photo": "sendPhoto",
@@ -120,24 +114,20 @@ def send_media_to_rubika(
 
 
 async def forward_message(client, message, channel_name, state):
-    """Unified forwarding logic for text and media messages."""
     msg_date = message.date
     if message.text and not message.media:
-        # Pure text message
+        # Pure text
         if send_text_to_rubika(channel_name, message.text, msg_date):
             state[channel_name] = message.id
             save_state(state)
         return
 
-    # Media message (photo, video, document, audio, voice, etc.)
-    # Determine file size
     if not message.file or not message.file.size:
         logger.warning(f"Message {message.id} has no file size info, skipping.")
         return
 
     file_size = message.file.size
     if file_size > MAX_FILE_SIZE:
-        # File too large – send a text notification
         size_mb = file_size / (1024 * 1024)
         skip_text = (
             f"⚠️ Large file skipped ({size_mb:.1f} MB)\n"
@@ -145,31 +135,23 @@ async def forward_message(client, message, channel_name, state):
         )
         logger.info(f"Skipping large file ({size_mb:.1f} MB) from {channel_name}")
         send_text_to_rubika(channel_name, skip_text, msg_date)
-        # Still mark as processed so we don't keep trying
         state[channel_name] = message.id
         save_state(state)
         return
 
-    # Determine media type
     if message.photo:
-        media_type = "photo"
-        filename = "photo.jpg"
+        media_type, filename = "photo", "photo.jpg"
     elif message.video:
-        media_type = "video"
-        filename = message.file.name or "video.mp4"
+        media_type, filename = "video", message.file.name or "video.mp4"
     elif message.audio:
-        media_type = "audio"
-        filename = message.file.name or "audio.mp3"
+        media_type, filename = "audio", message.file.name or "audio.mp3"
     elif message.voice:
-        media_type = "voice"
-        filename = message.file.name or "voice.ogg"
+        media_type, filename = "voice", message.file.name or "voice.ogg"
     else:
-        media_type = "document"
-        filename = message.file.name or "file"
+        media_type, filename = "document", message.file.name or "file"
 
     caption = message.text or ""
 
-    # Download the media into memory
     try:
         media_bytes = await client.download_media(message, file=bytes)
         logger.info(f"Downloaded {media_type} ({len(media_bytes)} bytes) from {channel_name}")
@@ -208,7 +190,6 @@ async def catch_up(client, channels, state):
                 last_id = state.get(channel, 0)
                 if msg.id <= last_id:
                     continue
-                # Skip if no content
                 if not msg.text and not msg.media:
                     continue
                 logger.info(f"Missed message {msg.id} from {channel}")
