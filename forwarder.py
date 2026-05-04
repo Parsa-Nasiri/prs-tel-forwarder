@@ -106,13 +106,22 @@ def send_text_to_rubika(channel: str, text: str, date: datetime) -> bool:
 
 def upload_file_to_rubika(file_bytes: bytes, file_name: str, file_type: str) -> str | None:
     """
-    Rubika two‑step upload:
-    1. requestSendFile -> returns data.upload_url
-    2. Upload file to that URL -> returns data.hash/file_id
-    Returns the file_id.
+    Rubika two‑step upload (RAW binary):
+    1. requestSendFile -> data.upload_url
+    2. PUT raw bytes to that URL (not multipart) -> data.hash (file_id)
     """
     type_map = {"photo":"Image","video":"Video","audio":"Music","voice":"Voice","document":"File"}
     rubika_type = type_map.get(file_type, "File")
+
+    # MIME type for the upload
+    mime_map = {
+        "photo": "image/jpeg",
+        "video": "video/mp4",
+        "audio": "audio/mpeg",
+        "voice": "audio/ogg",
+        "document": "application/octet-stream"
+    }
+    content_type = mime_map.get(file_type, "application/octet-stream")
 
     try:
         # Step 1: get upload URL
@@ -126,20 +135,23 @@ def upload_file_to_rubika(file_bytes: bytes, file_name: str, file_type: str) -> 
             logger.error(f"No upload_url in response: {r.text}")
             return None
 
-        # Step 2: upload the file
-        files = {"file": (file_name, BytesIO(file_bytes))}
-        r2 = requests.post(upload_url, files=files, timeout=30)
-        logger.info(f"File upload response [{r2.status_code}]: {r2.text}")
-        if r2.status_code != 200:
+        # Step 2: upload raw bytes (PUT)
+        headers = {"Content-Type": content_type}
+        r2 = requests.put(upload_url, data=file_bytes, headers=headers, timeout=60)
+        logger.info(f"File upload response [{r2.status_code}]: {r2.text[:200]}...")
+        if r2.status_code not in (200, 201, 204):
+            logger.error(f"Upload failed with status {r2.status_code}")
             return None
+
         up_data = r2.json()
-        file_id = up_data.get("data", {}).get("hash") or up_data.get("file_id") or up_data.get("data", {}).get("file_id")
+        # The upload response contains data.hash or file_id
+        file_id = up_data.get("data", {}).get("hash") or up_data.get("hash") or up_data.get("file_id")
         if not file_id:
-            logger.error(f"No file_id in file upload response: {r2.text}")
+            logger.error(f"No file_id in upload response: {r2.text}")
             return None
         return file_id
     except Exception as e:
-        logger.error(f"Upload failed: {e}")
+        logger.error(f"Upload exception: {e}")
         return None
 
 def send_file_to_rubika(channel: str, date: datetime, file_id: str, file_type: str, file_name: str, file_size: int, caption: str = "") -> bool:
@@ -165,16 +177,16 @@ def send_file_to_rubika(channel: str, date: datetime, file_id: str, file_type: s
         try:
             r = requests.post(url, json=payload, timeout=15)
             logger.info(f"sendFile response [{r.status_code}]: {r.text}")
-            if r.status_code != 200:
-                logger.error(f"❌ sendFile to {cid} error: {r.status_code} {r.text}")
-                ok = False
-            else:
+            if r.status_code == 200:
                 j = r.json()
                 if j.get("status") == "OK" or j.get("ok"):
                     logger.info(f"✅ File sent to {cid}")
                 else:
                     logger.error(f"❌ sendFile returned error for {cid}: {r.text}")
                     ok = False
+            else:
+                logger.error(f"❌ sendFile HTTP error to {cid}: {r.status_code}")
+                ok = False
         except Exception as e:
             logger.error(f"❌ Network error to {cid}: {e}")
             ok = False
@@ -247,7 +259,7 @@ async def forward_message(client, message, channel_name, state, skip_dup=False):
         state[channel_name] = message.id
         save_state(state)
 
-# ---------- Poller (Rubika getUpdates) ----------
+# ---------- Poller ----------
 async def poll_rubika_commands():
     global whitelist
     offset_id = ""
@@ -259,11 +271,20 @@ async def poll_rubika_commands():
                 payload["offset_id"] = offset_id
             r = requests.post(f"{BASE_URL}/getUpdates", json=payload, timeout=20)
             if r.status_code != 200:
+                logger.error(f"getUpdates HTTP {r.status_code}: {r.text[:200]}")
                 await asyncio.sleep(5)
                 continue
-            data = r.json()
-            updates = data.get("data", {}).get("updates", [])   # data.updates
-            next_offset_id = data.get("data", {}).get("next_offset_id", "")
+
+            resp_json = r.json()
+            if resp_json.get("status") != "OK":
+                logger.error(f"getUpdates status not OK: {resp_json}")
+                await asyncio.sleep(5)
+                continue
+
+            data = resp_json.get("data", {})
+            updates = data.get("updates", [])
+            next_offset_id = data.get("next_offset_id", "")
+
             for upd in updates:
                 offset_id = next_offset_id
                 msg = upd.get("message")
@@ -272,10 +293,13 @@ async def poll_rubika_commands():
                 text = msg.get("text", "").strip()
                 cid = str(msg["chat"]["id"])
 
-                # Non-admin: tell them their chat ID
+                # Non-admin: reply with their chat ID
                 if cid not in ADMIN_CHAT_IDS:
                     if text:
-                        requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"Your chat ID is `{cid}`. Send this to an admin to be whitelisted."}, timeout=10)
+                        requests.post(f"{BASE_URL}/sendMessage", json={
+                            "chat_id": cid,
+                            "text": f"Your chat ID is `{cid}`. Send this to an admin to be whitelisted."
+                        }, timeout=10)
                     continue
 
                 # Admin commands
