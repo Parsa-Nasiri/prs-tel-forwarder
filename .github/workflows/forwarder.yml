@@ -2,20 +2,29 @@ name: Telegram to Rubika Forwarder
 
 on:
   schedule:
-    # Every 6 hours – runs at 00:00, 06:00, 12:00, 18:00 UTC
-    - cron: "0 */6 * * *"
+    # Every 6 hours, offset by 5 min so we never land exactly on the hour.
+    # 5h 48min run + 12min gap = zero overlap possible.
+    - cron: "5 */6 * * *"
   workflow_dispatch:
+
+# ── Session safety ─────────────────────────────────────────────────────────────
+# If a second trigger fires while the job is still running, GitHub queues it
+# (cancel-in-progress: false) rather than starting a second job in parallel.
+# This guarantees the Telegram STRING_SESSION is never used from two IPs at once.
+concurrency:
+  group: forwarder-session
+  cancel-in-progress: false
 
 jobs:
   forwarder:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6‑hour hard limit
+    timeout-minutes: 360          # 6-hour hard ceiling
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -25,9 +34,18 @@ jobs:
 
       - name: Run forwarder
         env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          STRING_SESSION: ${{ secrets.STRING_SESSION }}
+          # ── Telegram ──────────────────────────────────────────────────────────
+          API_ID:           ${{ secrets.API_ID }}
+          API_HASH:         ${{ secrets.API_HASH }}
+          STRING_SESSION:   ${{ secrets.STRING_SESSION }}
+          # ── Rubika bot ────────────────────────────────────────────────────────
           RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
-          RUBIKA_CHAT_ID: ${{ secrets.RUBIKA_CHAT_ID }}
+          # Admin Rubika chat IDs (comma-separated); can send whitelist commands
+          ADMIN_CHAT_IDS:   ${{ secrets.ADMIN_CHAT_IDS }}
+          # Fallback recipients if whitelist repo not configured yet
+          RUBIKA_CHAT_IDS:  ${{ secrets.RUBIKA_CHAT_IDS }}
+          # ── Private data repo (whitelist + state) ─────────────────────────────
+          DATA_REPO_TOKEN:  ${{ secrets.DATA_REPO_TOKEN }}
+          DATA_REPO_OWNER:  ${{ secrets.DATA_REPO_OWNER }}
+          DATA_REPO_NAME:   ${{ secrets.DATA_REPO_NAME }}
         run: python forwarder.py
