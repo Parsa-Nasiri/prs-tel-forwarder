@@ -27,12 +27,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ---------- Private repo helpers ----------
-def github_request(method, path, json_data=None, extra_headers=None):
+def github_request(method, path, json_data=None):
     url = f"https://api.github.com/repos/{DATA_REPO_OWNER}/{DATA_REPO_NAME}/contents/{path}"
     headers = {"Authorization": f"token {DATA_REPO_TOKEN}"}
-    if extra_headers:
-        headers.update(extra_headers)
-    resp = requests.request(method, url, headers=headers, json=json_data)
+    resp = requests.request(method, url, headers=headers, json=json_data, timeout=15)
     return resp
 
 def get_file_from_repo(path):
@@ -66,7 +64,6 @@ def load_whitelist():
     except:
         wl = {}
     if not wl and ADMIN_CHAT_IDS:
-        # Auto-populate with admins on first run
         for cid in ADMIN_CHAT_IDS:
             wl[cid] = "Admin"
         push_file_to_repo("whitelist.json", json.dumps(wl, indent=2))
@@ -109,72 +106,50 @@ def send_text_to_rubika(channel: str, text: str, date: datetime) -> bool:
 
 def upload_file_to_rubika(file_bytes: bytes, file_name: str, file_type: str) -> str | None:
     """
-    Uploads a file to Rubika using the two-step process:
-    1. requestSendFile to get an upload URL
-    2. Upload the file to that URL
-    Returns the file_id to use with sendFile
+    Rubika two‑step upload:
+    1. requestSendFile -> returns data.upload_url
+    2. Upload file to that URL -> returns data.hash/file_id
+    Returns the file_id.
     """
-    # Step 1: requestSendFile
-    file_type_map = {
-        "photo": "Image",
-        "video": "Video",
-        "audio": "Music",
-        "voice": "Voice",
-        "document": "File"
-    }
-    rubika_type = file_type_map.get(file_type, "File")
-    
+    type_map = {"photo":"Image","video":"Video","audio":"Music","voice":"Voice","document":"File"}
+    rubika_type = type_map.get(file_type, "File")
+
     try:
-        # Request upload URL
-        req_url = f"{BASE_URL}/requestSendFile"
-        resp = requests.post(req_url, json={"type": rubika_type})
-        logger.info(f"requestSendFile response [{resp.status_code}]: {resp.text}")
-        if resp.status_code != 200:
-            logger.error(f"requestSendFile failed: {resp.status_code} {resp.text}")
+        # Step 1: get upload URL
+        r = requests.post(f"{BASE_URL}/requestSendFile", json={"type": rubika_type}, timeout=15)
+        logger.info(f"requestSendFile response [{r.status_code}]: {r.text}")
+        if r.status_code != 200:
             return None
-        
-        data = resp.json()
-        upload_url = data.get("upload_url")
+        data = r.json()
+        upload_url = data.get("data", {}).get("upload_url")
         if not upload_url:
-            logger.error(f"No upload_url in response: {resp.text}")
+            logger.error(f"No upload_url in response: {r.text}")
             return None
-        
-        # Step 2: Upload file to the provided URL
+
+        # Step 2: upload the file
         files = {"file": (file_name, BytesIO(file_bytes))}
-        upload_resp = requests.post(upload_url, files=files)
-        logger.info(f"File upload response [{upload_resp.status_code}]: {upload_resp.text}")
-        if upload_resp.status_code != 200:
-            logger.error(f"File upload failed: {upload_resp.status_code} {upload_resp.text}")
+        r2 = requests.post(upload_url, files=files, timeout=30)
+        logger.info(f"File upload response [{r2.status_code}]: {r2.text}")
+        if r2.status_code != 200:
             return None
-        
-        upload_data = upload_resp.json()
-        file_id = upload_data.get("file_id") or upload_data.get("hash")
+        up_data = r2.json()
+        file_id = up_data.get("data", {}).get("hash") or up_data.get("file_id") or up_data.get("data", {}).get("file_id")
         if not file_id:
-            logger.error(f"No file_id in upload response: {upload_resp.text}")
+            logger.error(f"No file_id in file upload response: {r2.text}")
             return None
-        
         return file_id
     except Exception as e:
-        logger.error(f"upload_file_to_rubika exception: {e}")
+        logger.error(f"Upload failed: {e}")
         return None
 
 def send_file_to_rubika(channel: str, date: datetime, file_id: str, file_type: str, file_name: str, file_size: int, caption: str = "") -> bool:
-    """
-    Sends a file to Rubika using the sendFile method
-    """
     caption = clean_text(caption)
     date_str = date.strftime("%Y-%m-%d %H:%M:%S")
     header = f"=============\n{channel}\n{date_str}\n============="
     full_cap = f"{header}\n\n{caption}" if caption else header
 
-    file_type_map = {
-        "photo": "Image",
-        "video": "Video",
-        "audio": "Music",
-        "voice": "Voice",
-        "document": "File"
-    }
-    rubika_type = file_type_map.get(file_type, "File")
+    type_map = {"photo":"Image","video":"Video","audio":"Music","voice":"Voice","document":"File"}
+    rubika_type = type_map.get(file_type, "File")
 
     url = f"{BASE_URL}/sendFile"
     ok = True
@@ -188,18 +163,18 @@ def send_file_to_rubika(channel: str, date: datetime, file_id: str, file_type: s
             "size": str(file_size)
         }
         try:
-            r = requests.post(url, json=payload, timeout=10)
+            r = requests.post(url, json=payload, timeout=15)
             logger.info(f"sendFile response [{r.status_code}]: {r.text}")
-            if r.status_code == 200:
+            if r.status_code != 200:
+                logger.error(f"❌ sendFile to {cid} error: {r.status_code} {r.text}")
+                ok = False
+            else:
                 j = r.json()
                 if j.get("status") == "OK" or j.get("ok"):
                     logger.info(f"✅ File sent to {cid}")
                 else:
-                    logger.error(f"❌ File send error to {cid}: {r.text}")
+                    logger.error(f"❌ sendFile returned error for {cid}: {r.text}")
                     ok = False
-            else:
-                logger.error(f"❌ File send HTTP error to {cid}: {r.status_code}")
-                ok = False
         except Exception as e:
             logger.error(f"❌ Network error to {cid}: {e}")
             ok = False
@@ -272,28 +247,23 @@ async def forward_message(client, message, channel_name, state, skip_dup=False):
         state[channel_name] = message.id
         save_state(state)
 
-# ---------- Poller ----------
+# ---------- Poller (Rubika getUpdates) ----------
 async def poll_rubika_commands():
     global whitelist
     offset_id = ""
     logger.info("Started Rubika command listener")
     while True:
         try:
-            # Use POST with offset_id and limit according to the documentation
             payload = {"limit": 10}
             if offset_id:
                 payload["offset_id"] = offset_id
-            
             r = requests.post(f"{BASE_URL}/getUpdates", json=payload, timeout=20)
             if r.status_code != 200:
-                logger.error(f"getUpdates HTTP error: {r.status_code}")
                 await asyncio.sleep(5)
                 continue
-            
             data = r.json()
-            updates = data.get("updates", [])
-            next_offset_id = data.get("next_offset_id", "")
-            
+            updates = data.get("data", {}).get("updates", [])   # data.updates
+            next_offset_id = data.get("data", {}).get("next_offset_id", "")
             for upd in updates:
                 offset_id = next_offset_id
                 msg = upd.get("message")
@@ -305,10 +275,7 @@ async def poll_rubika_commands():
                 # Non-admin: tell them their chat ID
                 if cid not in ADMIN_CHAT_IDS:
                     if text:
-                        requests.post(f"{BASE_URL}/sendMessage", json={
-                            "chat_id": cid,
-                            "text": f"Your chat ID is `{cid}`. Send this to an admin to be whitelisted."
-                        })
+                        requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"Your chat ID is `{cid}`. Send this to an admin to be whitelisted."}, timeout=10)
                     continue
 
                 # Admin commands
@@ -318,18 +285,18 @@ async def poll_rubika_commands():
                     name = parts[1] if len(parts) > 1 else ""
                     whitelist[target] = name
                     push_file_to_repo("whitelist.json", json.dumps(whitelist, indent=2))
-                    requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"✅ Whitelisted {target} ({name})"})
+                    requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"✅ Whitelisted {target} ({name})"}, timeout=10)
                 elif text.startswith("remove "):
                     target = text[len("remove "):].strip().lstrip('@')
                     if target in whitelist:
                         del whitelist[target]
                         push_file_to_repo("whitelist.json", json.dumps(whitelist, indent=2))
-                        requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"❌ Removed {target}"})
+                        requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"❌ Removed {target}"}, timeout=10)
                     else:
-                        requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": "Not in whitelist."})
+                        requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": "Not in whitelist."}, timeout=10)
                 elif text == "/list":
                     lst = "\n".join(f"{cid} → {name}" for cid, name in whitelist.items()) if whitelist else "(empty)"
-                    requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"Whitelist:\n{lst}"})
+                    requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": cid, "text": f"Whitelist:\n{lst}"}, timeout=10)
         except Exception as e:
             logger.error(f"Poll error: {e}")
         await asyncio.sleep(1)
