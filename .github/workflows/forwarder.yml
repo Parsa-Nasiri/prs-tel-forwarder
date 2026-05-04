@@ -2,7 +2,7 @@ name: Telegram to Rubika Forwarder
 
 on:
   schedule:
-    - cron: "5 */6 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
@@ -28,8 +28,5 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           STRING_SESSION: ${{ secrets.STRING_SESSION }}
           RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
-          ADMIN_CHAT_IDS: ${{ secrets.ADMIN_CHAT_IDS }}
-          DATA_REPO_OWNER: ${{ secrets.DATA_REPO_OWNER }}
-          DATA_REPO_NAME: ${{ secrets.DATA_REPO_NAME }}
-          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          RUBIKA_CHAT_IDS: ${{ secrets.RUBIKA_CHAT_IDS }}
         run: python forwarder.py
