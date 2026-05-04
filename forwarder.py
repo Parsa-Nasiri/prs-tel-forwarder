@@ -1,7 +1,6 @@
 import os, json, time, asyncio, logging, sys, base64
 from pathlib import Path
 from datetime import datetime
-from io import BytesIO
 import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -21,7 +20,6 @@ DATA_REPO_TOKEN = os.environ["DATA_REPO_TOKEN"]
 BASE_URL = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}"
 CHANNELS_FILE = Path("channels.json")
 RUN_DURATION = 20900          # 5h 48m
-MAX_FILE_SIZE = 50 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
 logger = logging.getLogger(__name__)
@@ -83,9 +81,22 @@ def save_state(state):
 whitelist = load_whitelist()
 logger.info(f"Whitelist loaded: {len(whitelist)} users")
 
-# ---------- Rubika API ----------
+# ---------- Helpers ----------
 def clean_text(text: str) -> str:
     return text.replace('`', '')
+
+def format_reactions(message) -> str:
+    if not hasattr(message, 'reactions') or not message.reactions:
+        return ""
+    results = message.reactions.results
+    if not results:
+        return ""
+    sorted_reacts = sorted(results, key=lambda r: r.count, reverse=True)[:3]
+    parts = []
+    for r in sorted_reacts:
+        emoji = r.reaction.emoticon if hasattr(r.reaction, 'emoticon') else ''
+        parts.append(f"{emoji}{r.count}")
+    return "  " + "  ".join(parts) if parts else ""
 
 def send_text_to_rubika(channel: str, text: str, date: datetime) -> bool:
     text = clean_text(text)
@@ -104,162 +115,24 @@ def send_text_to_rubika(channel: str, text: str, date: datetime) -> bool:
             ok = False
     return ok
 
-def upload_file_to_rubika(file_bytes: bytes, file_name: str, file_type: str) -> str | None:
-    """
-    Rubika two‑step upload (RAW binary):
-    1. requestSendFile -> data.upload_url
-    2. PUT raw bytes to that URL (not multipart) -> data.hash (file_id)
-    """
-    type_map = {"photo":"Image","video":"Video","audio":"Music","voice":"Voice","document":"File"}
-    rubika_type = type_map.get(file_type, "File")
-
-    # MIME type for the upload
-    mime_map = {
-        "photo": "image/jpeg",
-        "video": "video/mp4",
-        "audio": "audio/mpeg",
-        "voice": "audio/ogg",
-        "document": "application/octet-stream"
-    }
-    content_type = mime_map.get(file_type, "application/octet-stream")
-
-    try:
-        # Step 1: get upload URL
-        r = requests.post(f"{BASE_URL}/requestSendFile", json={"type": rubika_type}, timeout=15)
-        logger.info(f"requestSendFile response [{r.status_code}]: {r.text}")
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        upload_url = data.get("data", {}).get("upload_url")
-        if not upload_url:
-            logger.error(f"No upload_url in response: {r.text}")
-            return None
-
-        # Step 2: upload raw bytes (PUT)
-        headers = {"Content-Type": content_type}
-        r2 = requests.put(upload_url, data=file_bytes, headers=headers, timeout=60)
-        logger.info(f"File upload response [{r2.status_code}]: {r2.text[:200]}...")
-        if r2.status_code not in (200, 201, 204):
-            logger.error(f"Upload failed with status {r2.status_code}")
-            return None
-
-        up_data = r2.json()
-        # The upload response contains data.hash or file_id
-        file_id = up_data.get("data", {}).get("hash") or up_data.get("hash") or up_data.get("file_id")
-        if not file_id:
-            logger.error(f"No file_id in upload response: {r2.text}")
-            return None
-        return file_id
-    except Exception as e:
-        logger.error(f"Upload exception: {e}")
-        return None
-
-def send_file_to_rubika(channel: str, date: datetime, file_id: str, file_type: str, file_name: str, file_size: int, caption: str = "") -> bool:
-    caption = clean_text(caption)
-    date_str = date.strftime("%Y-%m-%d %H:%M:%S")
-    header = f"=============\n{channel}\n{date_str}\n============="
-    full_cap = f"{header}\n\n{caption}" if caption else header
-
-    type_map = {"photo":"Image","video":"Video","audio":"Music","voice":"Voice","document":"File"}
-    rubika_type = type_map.get(file_type, "File")
-
-    url = f"{BASE_URL}/sendFile"
-    ok = True
-    for cid in whitelist:
-        payload = {
-            "chat_id": cid,
-            "file_id": file_id,
-            "type": rubika_type,
-            "caption": full_cap,
-            "file_name": file_name,
-            "size": str(file_size)
-        }
-        try:
-            r = requests.post(url, json=payload, timeout=15)
-            logger.info(f"sendFile response [{r.status_code}]: {r.text}")
-            if r.status_code == 200:
-                j = r.json()
-                if j.get("status") == "OK" or j.get("ok"):
-                    logger.info(f"✅ File sent to {cid}")
-                else:
-                    logger.error(f"❌ sendFile returned error for {cid}: {r.text}")
-                    ok = False
-            else:
-                logger.error(f"❌ sendFile HTTP error to {cid}: {r.status_code}")
-                ok = False
-        except Exception as e:
-            logger.error(f"❌ Network error to {cid}: {e}")
-            ok = False
-    return ok
-
-def format_reactions(message) -> str:
-    if not hasattr(message, 'reactions') or not message.reactions:
-        return ""
-    results = message.reactions.results
-    if not results:
-        return ""
-    sorted_reacts = sorted(results, key=lambda r: r.count, reverse=True)[:3]
-    parts = []
-    for r in sorted_reacts:
-        emoji = r.reaction.emoticon if hasattr(r.reaction, 'emoticon') else ''
-        parts.append(f"{emoji}{r.count}")
-    return "  " + "  ".join(parts) if parts else ""
-
-# ---------- Forwarding ----------
-async def forward_message(client, message, channel_name, state, skip_dup=False):
+# ---------- Forwarding (text only) ----------
+async def forward_message(message, channel_name, state, skip_dup=False):
+    """Processes only text messages (ignores media)."""
     msg_date = message.date
     if not skip_dup and message.id <= state.get(channel_name, 0):
         return
 
+    if not message.text:
+        return  # ignore media/polls/etc
+
     reactions_str = format_reactions(message)
+    full_text = message.text + reactions_str
 
-    if message.text and not message.media:
-        full_text = message.text + reactions_str
-        if send_text_to_rubika(channel_name, full_text, msg_date):
-            state[channel_name] = message.id
-            save_state(state)
-        return
-
-    if not message.file or not message.file.size:
-        return
-    file_size = message.file.size
-    if file_size > MAX_FILE_SIZE:
-        size_mb = file_size/(1024*1024)
-        send_text_to_rubika(channel_name, f"⚠️ Large file skipped ({size_mb:.1f} MB)\nOriginal: {message.file.name or 'unknown'}", msg_date)
-        state[channel_name] = message.id
-        save_state(state)
-        return
-
-    if message.photo:
-        media_type, filename = "photo", "photo.jpg"
-    elif message.video:
-        media_type, filename = "video", message.file.name or "video.mp4"
-    elif message.audio:
-        media_type, filename = "audio", message.file.name or "audio.mp3"
-    elif message.voice:
-        media_type, filename = "voice", message.file.name or "voice.ogg"
-    else:
-        media_type, filename = "document", message.file.name or "unknown_file"
-
-    caption = (message.text or "") + reactions_str
-
-    try:
-        data = await client.download_media(message, file=bytes)
-        logger.info(f"Downloaded {media_type} ({len(data)} bytes)")
-    except Exception as e:
-        logger.error(f"Download failed: {e}")
-        return
-
-    file_id = upload_file_to_rubika(data, filename, media_type)
-    if not file_id:
-        logger.error("Failed to upload file to Rubika")
-        return
-
-    if send_file_to_rubika(channel_name, msg_date, file_id, media_type, filename, len(data), caption):
+    if send_text_to_rubika(channel_name, full_text, msg_date):
         state[channel_name] = message.id
         save_state(state)
 
-# ---------- Poller ----------
+# ---------- Poller (Rubika getUpdates) ----------
 async def poll_rubika_commands():
     global whitelist
     offset_id = ""
@@ -353,10 +226,10 @@ async def catch_up(client, channels, state):
             for m in reversed(msgs):
                 if m.id <= state.get(ch, 0):
                     continue
-                if not m.text and not m.media:
+                if not m.text:
                     continue
                 logger.info(f"Missed {m.id} from {ch}")
-                await forward_message(client, m, ch, state)
+                await forward_message(m, ch, state)
         except Exception as e:
             logger.error(f"Catchup {ch}: {e}")
 
@@ -366,10 +239,10 @@ async def debug_resend_last3(client, channels, state):
         try:
             msgs = await client.get_messages(ch, limit=3)
             for m in reversed(msgs):
-                if not m.text and not m.media:
+                if not m.text:
                     continue
                 logger.info(f"DEBUG resend {m.id} from {ch}")
-                await forward_message(client, m, ch, state, skip_dup=True)
+                await forward_message(m, ch, state, skip_dup=True)
         except Exception as e:
             logger.error(f"DEBUG {ch}: {e}")
 
@@ -399,11 +272,11 @@ async def main():
     async def handler(event):
         try:
             chat = await event.get_chat()
-            await forward_message(client, event.message, chat.title, state)
+            await forward_message(event.message, chat.title, state)
         except Exception as e:
             logger.error(f"Handler error: {e}")
 
-    logger.info("Forwarding live…")
+    logger.info("Forwarding live (text only)…")
     start = time.time()
     try:
         while (time.time() - start) < RUN_DURATION:
