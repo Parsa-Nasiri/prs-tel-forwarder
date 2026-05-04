@@ -36,7 +36,6 @@ def github_request(method, path, json_data=None, extra_headers=None):
     return resp
 
 def get_file_from_repo(path):
-    """Download a file from the private repo, return its content as string, or empty dict/list."""
     resp = github_request("GET", path)
     if resp.status_code == 200:
         content = resp.json().get("content", "")
@@ -45,7 +44,6 @@ def get_file_from_repo(path):
     return ""
 
 def push_file_to_repo(path, content_str):
-    """Create or update a file in the private repo."""
     resp = github_request("GET", path)
     sha = resp.json().get("sha") if resp.status_code == 200 else None
     payload = {
@@ -85,7 +83,6 @@ def load_state():
 def save_state(state):
     push_file_to_repo("state.json", json.dumps(state, indent=2))
 
-# Global whitelist (dict chat_id -> name)
 whitelist = load_whitelist()
 logger.info(f"Whitelist loaded: {len(whitelist)} users")
 
@@ -110,48 +107,98 @@ def send_text_to_rubika(channel: str, text: str, date: datetime) -> bool:
             ok = False
     return ok
 
-def upload_file(byte_data: bytes, filename: str, file_type: str, chat_id: str) -> str | None:
-    url = f"{BASE_URL}/uploadFile"
+def upload_file_to_rubika(file_bytes: bytes, file_name: str, file_type: str) -> str | None:
+    """
+    Uploads a file to Rubika using the two-step process:
+    1. requestSendFile to get an upload URL
+    2. Upload the file to that URL
+    Returns the file_id to use with sendFile
+    """
+    # Step 1: requestSendFile
+    file_type_map = {
+        "photo": "Image",
+        "video": "Video",
+        "audio": "Music",
+        "voice": "Voice",
+        "document": "File"
+    }
+    rubika_type = file_type_map.get(file_type, "File")
+    
     try:
-        files = {"file": (filename, BytesIO(byte_data))}
-        data = {"chat_id": chat_id, "file_name": filename, "file_type": file_type}
-        r = requests.post(url, data=data, files=files, timeout=30)
-        logger.info(f"uploadFile response [{r.status_code}]: {r.text}")
-        if r.status_code == 200:
-            j = r.json()
-            if j.get("status") == "OK" and "file_id" in j:
-                return j["file_id"]
-            else:
-                logger.error(f"uploadFile returned: {r.text}")
-        else:
-            logger.error(f"uploadFile HTTP {r.status_code}")
+        # Request upload URL
+        req_url = f"{BASE_URL}/requestSendFile"
+        resp = requests.post(req_url, json={"type": rubika_type})
+        logger.info(f"requestSendFile response [{resp.status_code}]: {resp.text}")
+        if resp.status_code != 200:
+            logger.error(f"requestSendFile failed: {resp.status_code} {resp.text}")
+            return None
+        
+        data = resp.json()
+        upload_url = data.get("upload_url")
+        if not upload_url:
+            logger.error(f"No upload_url in response: {resp.text}")
+            return None
+        
+        # Step 2: Upload file to the provided URL
+        files = {"file": (file_name, BytesIO(file_bytes))}
+        upload_resp = requests.post(upload_url, files=files)
+        logger.info(f"File upload response [{upload_resp.status_code}]: {upload_resp.text}")
+        if upload_resp.status_code != 200:
+            logger.error(f"File upload failed: {upload_resp.status_code} {upload_resp.text}")
+            return None
+        
+        upload_data = upload_resp.json()
+        file_id = upload_data.get("file_id") or upload_data.get("hash")
+        if not file_id:
+            logger.error(f"No file_id in upload response: {upload_resp.text}")
+            return None
+        
+        return file_id
     except Exception as e:
-        logger.error(f"uploadFile exception: {e}")
-    return None
+        logger.error(f"upload_file_to_rubika exception: {e}")
+        return None
 
-def send_media_by_id(channel: str, date: datetime, file_id: str, media_type: str, caption: str = "") -> bool:
+def send_file_to_rubika(channel: str, date: datetime, file_id: str, file_type: str, file_name: str, file_size: int, caption: str = "") -> bool:
+    """
+    Sends a file to Rubika using the sendFile method
+    """
     caption = clean_text(caption)
     date_str = date.strftime("%Y-%m-%d %H:%M:%S")
     header = f"=============\n{channel}\n{date_str}\n============="
     full_cap = f"{header}\n\n{caption}" if caption else header
 
-    method = {"photo":"sendPhoto","video":"sendVideo","audio":"sendAudio","voice":"sendVoice","document":"sendDocument"}.get(media_type, "sendDocument")
-    url = f"{BASE_URL}/{method}"
+    file_type_map = {
+        "photo": "Image",
+        "video": "Video",
+        "audio": "Music",
+        "voice": "Voice",
+        "document": "File"
+    }
+    rubika_type = file_type_map.get(file_type, "File")
+
+    url = f"{BASE_URL}/sendFile"
     ok = True
     for cid in whitelist:
-        payload = {"chat_id": cid, "file": file_id, "caption": full_cap}
+        payload = {
+            "chat_id": cid,
+            "file_id": file_id,
+            "type": rubika_type,
+            "caption": full_cap,
+            "file_name": file_name,
+            "size": str(file_size)
+        }
         try:
             r = requests.post(url, json=payload, timeout=10)
-            logger.info(f"{method} response [{r.status_code}]: {r.text}")
+            logger.info(f"sendFile response [{r.status_code}]: {r.text}")
             if r.status_code == 200:
                 j = r.json()
                 if j.get("status") == "OK" or j.get("ok"):
-                    logger.info(f"✅ {media_type} sent to {cid}")
+                    logger.info(f"✅ File sent to {cid}")
                 else:
-                    logger.error(f"❌ Media error to {cid}: {r.text}")
+                    logger.error(f"❌ File send error to {cid}: {r.text}")
                     ok = False
             else:
-                logger.error(f"❌ Media HTTP error to {cid}: {r.status_code}")
+                logger.error(f"❌ File send HTTP error to {cid}: {r.status_code}")
                 ok = False
         except Exception as e:
             logger.error(f"❌ Network error to {cid}: {e}")
@@ -198,19 +245,14 @@ async def forward_message(client, message, channel_name, state, skip_dup=False):
 
     if message.photo:
         media_type, filename = "photo", "photo.jpg"
-        file_type = "image/jpeg"
     elif message.video:
         media_type, filename = "video", message.file.name or "video.mp4"
-        file_type = "video/mp4"
     elif message.audio:
         media_type, filename = "audio", message.file.name or "audio.mp3"
-        file_type = "audio/mpeg"
     elif message.voice:
         media_type, filename = "voice", message.file.name or "voice.ogg"
-        file_type = "audio/ogg"
     else:
         media_type, filename = "document", message.file.name or "unknown_file"
-        file_type = "application/octet-stream"
 
     caption = (message.text or "") + reactions_str
 
@@ -221,39 +263,39 @@ async def forward_message(client, message, channel_name, state, skip_dup=False):
         logger.error(f"Download failed: {e}")
         return
 
-    upload_chat = next(iter(whitelist), None)
-    if not upload_chat:
-        logger.error("Whitelist empty, cannot upload.")
-        return
-    file_id = upload_file(data, filename, file_type, upload_chat)
+    file_id = upload_file_to_rubika(data, filename, media_type)
     if not file_id:
+        logger.error("Failed to upload file to Rubika")
         return
-    if send_media_by_id(channel_name, msg_date, file_id, media_type, caption):
+
+    if send_file_to_rubika(channel_name, msg_date, file_id, media_type, filename, len(data), caption):
         state[channel_name] = message.id
         save_state(state)
 
 # ---------- Poller ----------
 async def poll_rubika_commands():
     global whitelist
-    offset = 0
+    offset_id = ""
     logger.info("Started Rubika command listener")
     while True:
         try:
-            url = f"{BASE_URL}/getUpdates?offset={offset}&timeout=15"
-            r = requests.get(url, timeout=20)
+            # Use POST with offset_id and limit according to the documentation
+            payload = {"limit": 10}
+            if offset_id:
+                payload["offset_id"] = offset_id
+            
+            r = requests.post(f"{BASE_URL}/getUpdates", json=payload, timeout=20)
             if r.status_code != 200:
+                logger.error(f"getUpdates HTTP error: {r.status_code}")
                 await asyncio.sleep(5)
                 continue
-            raw_text = r.text
-            try:
-                updates = json.loads(raw_text)
-            except json.JSONDecodeError:
-                logger.error(f"Invalid JSON from getUpdates (first 200 chars): {raw_text[:200]}")
-                await asyncio.sleep(5)
-                continue
-
+            
+            data = r.json()
+            updates = data.get("updates", [])
+            next_offset_id = data.get("next_offset_id", "")
+            
             for upd in updates:
-                offset = upd.get("update_id", 0) + 1
+                offset_id = next_offset_id
                 msg = upd.get("message")
                 if not msg:
                     continue
@@ -378,7 +420,7 @@ async def main():
     finally:
         poll_task.cancel()
         await client.disconnect()
-        save_state(state)   # final save
+        save_state(state)
         logger.info("Disconnected cleanly")
 
 if __name__ == "__main__":
