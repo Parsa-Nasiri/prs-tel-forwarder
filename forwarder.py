@@ -65,23 +65,26 @@ def save_state(state: dict):
 
 # ---------- Rubika API ----------
 def send_text_to_rubika(chat_id: str, text: str) -> tuple[bool, str | None]:
-    """Send text and return (success, message_id)."""
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            # Rubika returns message_id inside "result" sometimes, or directly "message_id"? 
-            # We'll try both.
-            msg_id = data.get("result", {}).get("message_id") or data.get("message_id")
+        data = resp.json()
+        # Rubika can return "status": "OK" or "ok" : true
+        if data.get("status") == "OK" or data.get("ok"):
+            # Try multiple possible paths for message_id
+            msg_id = (
+                data.get("message_id") or
+                data.get("result", {}).get("message_id") or
+                data.get("data", {}).get("message_id")
+            )
             if msg_id:
                 return True, str(msg_id)
             else:
-                logger.error(f"sendMessage missing message_id: {resp.text}")
+                logger.error(f"Could not find message_id in response: {data}")
                 return False, None
         else:
-            logger.error(f"sendMessage HTTP {resp.status_code}: {resp.text}")
+            logger.error(f"Rubika API error: {resp.text}")
             return False, None
     except Exception as e:
         logger.error(f"sendMessage exception: {e}")
