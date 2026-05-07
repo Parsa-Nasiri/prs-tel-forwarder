@@ -21,7 +21,7 @@ RUBIKA_CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()
 
 CHANNELS_FILE = Path("channels.json")
 STATE_FILE = Path("state.json")
-RUN_DURATION = 20400          # 5h 40m (ends 20 min before the 6‑hour limit)
+RUN_DURATION = 20400          # 5h 40m (stops 20 min before 6h GitHub limit)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +29,7 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+
 
 # ---------- Reaction helpers ----------
 def get_top_reactions(message) -> str:
@@ -70,18 +71,17 @@ def send_text_to_rubika(chat_id: str, text: str) -> tuple[bool, str | None]:
     try:
         resp = requests.post(url, json=payload, timeout=10)
         data = resp.json()
-        # Rubika can return "status": "OK" or "ok" : true
-        if data.get("status") == "OK" or data.get("ok"):
-            # Try multiple possible paths for message_id
+        # Check success status
+        if data.get("status") == "OK" or data.get("ok") == True:
             msg_id = (
-                data.get("message_id") or
-                data.get("result", {}).get("message_id") or
-                data.get("data", {}).get("message_id")
+                data.get("message_id")
+                or data.get("result", {}).get("message_id")
+                or data.get("data", {}).get("message_id")
             )
             if msg_id:
                 return True, str(msg_id)
             else:
-                logger.error(f"Could not find message_id in response: {data}")
+                logger.error(f"message_id missing in response: {data}")
                 return False, None
         else:
             logger.error(f"Rubika API error: {resp.text}")
@@ -91,7 +91,6 @@ def send_text_to_rubika(chat_id: str, text: str) -> tuple[bool, str | None]:
         return False, None
 
 def edit_text_in_rubika(chat_id: str, message_id: str, new_text: str) -> bool:
-    """Edit a text message."""
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/editMessageText"
     payload = {"chat_id": chat_id, "message_id": message_id, "text": new_text}
     try:
@@ -106,46 +105,65 @@ def edit_text_in_rubika(chat_id: str, message_id: str, new_text: str) -> bool:
         return False
 
 
-# ---------- Delayed reaction update ----------
+# ---------- Delayed reaction updates (5min + 15min) ----------
 pending_edits: dict[tuple[str, int], list[dict]] = {}
 """
 Key: (channel_name, telegram_msg_id)
 Value: list of dicts with keys: chat_id, rubika_msg_id, full_original_text
 """
 
-async def delayed_reaction_update(client: TelegramClient, channel_name: str, tg_msg_id: int):
-    """Wait 5 minutes, then fetch reactions and edit the Rubika messages."""
-    await asyncio.sleep(300)   # 5 minutes
+async def delayed_reaction_updates(client: TelegramClient, channel_name: str, tg_msg_id: int):
+    """
+    Edit the Rubika message after 5 minutes, then again after 15 minutes,
+    each time appending the current top 3 reactions.
+    """
     key = (channel_name, tg_msg_id)
-    entries = pending_edits.pop(key, [])
+    entries = pending_edits.get(key)
     if not entries:
+        logger.warning(f"No pending entries for {tg_msg_id}")
         return
 
+    # Wait 5 minutes before first edit
+    await asyncio.sleep(300)
+
+    # --- First edit at +5 min ---
+    await _apply_reaction_edit(client, channel_name, tg_msg_id, entries, "5 min")
+
+    # Wait another 10 minutes (total 15 min from original)
+    await asyncio.sleep(600)
+
+    # --- Second edit at +15 min ---
+    await _apply_reaction_edit(client, channel_name, tg_msg_id, entries, "15 min")
+
+    # Clean up after both edits
+    pending_edits.pop(key, None)
+
+
+async def _apply_reaction_edit(client, channel_name, tg_msg_id, entries, label):
+    """Fetch latest reactions and edit all Rubika message copies."""
     try:
-        # Re‑fetch the message to get current reactions
         msg = await client.get_messages(channel_name, ids=tg_msg_id)
         if not msg:
-            logger.warning(f"Delayed update: TG message {tg_msg_id} not found.")
+            logger.warning(f"{label} edit: TG message {tg_msg_id} not found (maybe deleted).")
             return
         reaction_str = get_top_reactions(msg)
         if not reaction_str:
-            logger.info(f"No reactions for {tg_msg_id} after 5 min, skipping edit.")
+            logger.info(f"{label} edit: No reactions for {tg_msg_id}, skipping.")
             return
-        reaction_line = f"\n{reaction_str}"
 
+        reaction_line = f"\n{reaction_str}"
         for entry in entries:
             new_text = entry["full_original_text"] + reaction_line
             if edit_text_in_rubika(entry["chat_id"], entry["rubika_msg_id"], new_text):
-                logger.info(f"✅ Edited message {entry['rubika_msg_id']} with reactions.")
+                logger.info(f"✅ {label} edit: message {entry['rubika_msg_id']} updated with reactions.")
             else:
-                logger.error(f"❌ Failed to edit {entry['rubika_msg_id']}")
+                logger.error(f"❌ {label} edit failed for {entry['rubika_msg_id']}")
     except Exception as e:
-        logger.error(f"Delayed reaction update error for {tg_msg_id}: {e}")
+        logger.error(f"Error during {label} edit for {tg_msg_id}: {e}", exc_info=True)
 
 
 # ---------- Core forwarding logic ----------
 async def forward_message(client, message, channel_name, state, skip_duplicate_check=False):
-    """Forward a text message only; schedule reaction edit after 5 min."""
     msg_date = message.date
 
     if not skip_duplicate_check:
@@ -154,35 +172,34 @@ async def forward_message(client, message, channel_name, state, skip_duplicate_c
             logger.debug(f"Skipping duplicate message {message.id}")
             return
 
-    # IGNORE ALL MEDIA MESSAGES
+    # Ignore media messages completely
     if message.media:
         logger.info(f"Skipping media message {message.id} from {channel_name}")
-        # still mark as processed so we don't loop on it
+        # Mark as processed so we don't retry
         state[channel_name] = message.id
         save_state(state)
         return
 
-    # Only text messages without media
+    # Only text messages
     if not message.text:
         return
 
-    # Build the header
+    # Build header and full original text (without reactions)
     date_str = msg_date.strftime("%Y-%m-%d %H:%M:%S")
     header = f"=============\n{channel_name}\n{date_str}\n=============\n\n"
-    full_text = header + message.text.replace('`', '')
+    full_original_text = header + message.text.replace('`', '')
 
-    # Prepare tracking
-    track_key = (channel_name, message.id)
-    pending_edits[track_key] = []
+    key = (channel_name, message.id)
+    pending_edits[key] = []
 
     all_ok = True
     for chat_id in RUBIKA_CHAT_IDS:
-        success, rubika_msg_id = send_text_to_rubika(chat_id, full_text)
+        success, rubika_msg_id = send_text_to_rubika(chat_id, full_original_text)
         if success and rubika_msg_id:
-            pending_edits[track_key].append({
+            pending_edits[key].append({
                 "chat_id": chat_id,
                 "rubika_msg_id": rubika_msg_id,
-                "full_original_text": full_text
+                "full_original_text": full_original_text
             })
             logger.info(f"✅ Text forwarded to {chat_id} from {channel_name}")
         else:
@@ -191,8 +208,8 @@ async def forward_message(client, message, channel_name, state, skip_duplicate_c
     if all_ok:
         state[channel_name] = message.id
         save_state(state)
-        # Schedule the delayed edit
-        asyncio.ensure_future(delayed_reaction_update(client, channel_name, message.id))
+        # Schedule the dual timed edits
+        asyncio.ensure_future(delayed_reaction_updates(client, channel_name, message.id))
 
 
 # ---------- Startup ----------
@@ -232,24 +249,6 @@ async def catch_up(client, channels, state):
             logger.error(f"Error catching up {channel}: {e}")
 
 
-async def debug_resend_last3(client, channels, state):
-    """First run: resend the 3 most recent TEXT messages for verification."""
-    logger.info("DEBUG: Resending the 3 most recent TEXT messages from each channel.")
-    for channel in channels:
-        try:
-            messages = await client.get_messages(channel, limit=3)
-            if not messages:
-                continue
-            for msg in reversed(messages):
-                # Skip media or empty
-                if not msg.text or msg.media:
-                    continue
-                logger.info(f"DEBUG: resending {msg.id} from {channel}")
-                await forward_message(client, msg, channel, state, skip_duplicate_check=True)
-        except Exception as e:
-            logger.error(f"DEBUG resend error for {channel}: {e}")
-
-
 # ---------- Main ----------
 async def main():
     if not all([API_ID, API_HASH, STRING_SESSION, RUBIKA_BOT_TOKEN, RUBIKA_CHAT_IDS]):
@@ -265,12 +264,7 @@ async def main():
     logger.info("Telegram client ready")
 
     state = load_state()
-    first_run = (state == {})
-
     await catch_up(client, channels, state)
-
-    if first_run:
-        await debug_resend_last3(client, channels, state)
 
     @client.on(events.NewMessage(chats=channels))
     async def handler(event):
@@ -282,7 +276,7 @@ async def main():
         except Exception as e:
             logger.error(f"Handler error: {e}")
 
-    logger.info("Now forwarding messages in real‑time…")
+    logger.info("Now forwarding messages in real-time…")
     start = time.time()
 
     while True:
