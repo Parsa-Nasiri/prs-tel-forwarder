@@ -21,7 +21,7 @@ RUBIKA_CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()
 
 CHANNELS_FILE = Path("channels.json")
 STATE_FILE = Path("state.json")
-RUN_DURATION = 21300          # 5h 55m
+RUN_DURATION = 20400          # 5h 40m (ends 20 min before the 6‑hour limit)
 
 logging.basicConfig(
     level=logging.INFO,
