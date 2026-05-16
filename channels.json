@@ -36,5 +36,7 @@
     "@iproxy_meli",
     "@nufilter",
     "@v2ray_spatial",
-    "@configx2ray0"
+    "@configx2ray0",
+    "@appxa",
+    "@hiddify_nexttt"
 ]
